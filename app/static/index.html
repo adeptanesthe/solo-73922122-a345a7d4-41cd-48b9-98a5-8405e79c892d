@@ -136,6 +136,23 @@
         <div class="hint">同一 token 流重新拆成 1–4 个微批；损失、共享 W 梯度与更新后权重均应不变。</div>
       </div>
       <div class="card">
+        <h2>共享行冲突诊断（输入嵌入 vs 输出投影）</h2>
+        <div id="conflictMeta" class="hint">尚未运行。</div>
+        <table>
+          <thead><tr><th>行号</th><th style="text-align:right">输入路径范数</th>
+          <th style="text-align:right">输出路径范数</th><th style="text-align:right">合并范数</th>
+          <th style="text-align:right">抵消量</th><th style="text-align:right">抵消比例</th></tr></thead>
+          <tbody id="conflictRows"></tbody>
+        </table>
+        <div class="hint">
+          同一 W 行兼任输入嵌入与输出投影；按全部有效目标的平均交叉熵分别计算两条路径的行梯度，
+          重复输入号累加，目标 -100 不贡献梯度。对两份梯度都非零的行，
+          抵消量 = 输入范数 + 输出范数 − 合并范数，抵消比例 = 抵消量 ÷ 两者范数之和；
+          下表列出抵消量最大的前 10 行。分解梯度合计与原共享 W 梯度的最大绝对误差须 ≤1e-8，
+          否则清除诊断、不给出冲突结论（训练对照不受影响）。
+        </div>
+      </div>
+      <div class="card">
         <h2>内存约束与原始报告</h2>
         <div id="memory" class="hint"></div>
         <pre id="raw">（运行后显示）</pre>
@@ -231,6 +248,44 @@ function fmt(x) {
   return x.toPrecision(12);
 }
 
+function renderConflict(report) {
+  const meta = $("conflictMeta");
+  const body = $("conflictRows");
+  // Always start from a clean slate so a failed / stale run leaves nothing.
+  body.innerHTML = "";
+  const c = report.conflict;
+  if (!c || !c.available) {
+    meta.className = "err";
+    meta.textContent = "冲突诊断不可用：" +
+      ((c && c.reason) || "未返回诊断结果") +
+      "（已清除旧诊断，不给出冲突结论；训练对照结论不受影响）";
+    return;
+  }
+  meta.className = "hint";
+  meta.innerHTML =
+    `分解梯度合计 vs 原共享 W 梯度最大绝对误差：<b class="ok">${fmt(c.decomposition_max_abs_diff)}</b>` +
+    `（阈值 ${c.tolerance}）｜ 分块词表轴上限 <b>${c.max_vocab_chunk}</b><br>` +
+    `输入路径非零行：<b>${c.rows_with_input_grad}</b> ｜ 输出路径非零行：<b>${c.rows_with_output_grad}</b>` +
+    ` ｜ 两路径均非零的行：<b>${c.qualifying_rows}</b>（展示抵消量最大的前 ${c.top_rows.length} 行）`;
+  if (!c.top_rows.length) {
+    body.innerHTML = `<tr><td colspan="6">没有两条路径梯度都非零的行，无冲突可报告。</td></tr>`;
+    return;
+  }
+  body.innerHTML = c.top_rows.map((r, i) => `
+    <tr><td>${r.row}${i === 0 ? ' <span class="pill">最大</span>' : ""}</td>
+        <td class="num">${fmt(r.input_norm)}</td>
+        <td class="num">${fmt(r.output_norm)}</td>
+        <td class="num">${fmt(r.combined_norm)}</td>
+        <td class="num">${fmt(r.cancellation)}</td>
+        <td class="num">${(r.cancellation_ratio * 100).toFixed(4)}%</td></tr>`).join("");
+}
+
+function clearConflict() {
+  $("conflictMeta").className = "hint";
+  $("conflictMeta").textContent = "尚未运行。";
+  $("conflictRows").innerHTML = "";
+}
+
 function render(report) {
   $("raw").textContent = JSON.stringify(report, null, 2);
   const verdict = $("verdict");
@@ -274,6 +329,8 @@ function render(report) {
     ` ｜ 反向重算：<b class="ok">${m.recompute_in_backward ? "是" : "否"}</b><br>` +
     `跨前向/反向保存的张量：${m.saved_tensor_roles.join("、")}<br>` +
     `各微批保存形状：[${m.saved_shapes_per_microbatch.map((s) => "(" + s.map((x) => x.join("×")).join("), (") + ")").join(" ｜ ")}]`;
+
+  renderConflict(report);
 }
 
 async function run() {
@@ -282,6 +339,9 @@ async function run() {
   let payload;
   try { payload = collectPayload(); }
   catch (e) { $("error").textContent = e.message; return; }
+  // Drop any previous diagnostics before the request: if this run fails or its
+  // decomposition is inconsistent, no stale conflict conclusion may remain.
+  clearConflict();
   btn.disabled = true;
   $("status").textContent = "运行中…";
   try {
@@ -304,6 +364,7 @@ async function run() {
     $("verdict").className = "verdict fail";
     $("status").textContent = "失败";
     $("status").className = "pill bad";
+    clearConflict();
   } finally {
     btn.disabled = false;
   }

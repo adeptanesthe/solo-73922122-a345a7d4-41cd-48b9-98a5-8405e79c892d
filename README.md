@@ -17,6 +17,8 @@
   1–4 个微批时损失、梯度、更新后权重不变。
 * 内置三个样例：重复 token、不等有效长度（含整批被忽略）、大分数（scale=100，
   词表 4096）。
+* 共享行**冲突诊断**：同一 W 行兼任输入嵌入与输出投影时，分别计算两条路径的行梯度，
+  找出互相抵消的行（见下节）。
 
 ## 快速开始
 
@@ -89,6 +91,17 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
                "max_weight_diff": 0.0, "runs": [ ... ] },
   "checks":  { "loss": true, "grad": true, "updated_weight": true,
                "split_loss": true, "split_grad": true, "split_weight": true },
+  "conflict": {
+    "available": true,
+    "decomposition_max_abs_diff": 2.2e-16,
+    "max_vocab_chunk": 128,
+    "rows_with_input_grad": 3, "rows_with_output_grad": 256,
+    "qualifying_rows": 3,
+    "top_rows": [
+      { "row": 4, "input_norm": 1.72, "output_norm": 1.30, "combined_norm": 2.98,
+        "norm_sum": 3.03, "cancellation": 0.0466, "cancellation_ratio": 0.0154 }
+    ]
+  },
   "memory":  { "max_vocab_chunk": 128, "scores_or_probabilities_saved": false,
                "recompute_in_backward": true, ... }
 }
@@ -99,6 +112,28 @@ python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 * 拆分不变量：把同一 token 流（保持顺序）重新均分为 1–4 个微批，各自跑一遍，
   与用户录入的微批结果比较，再取最大值。
 * 只有六个 `checks` 全为 true，`ok` 才为 true，网页才显示“通过”。
+
+## 共享行冲突诊断
+
+按**全部有效目标**（`-100` 不参与损失）的平均交叉熵，把共享 W 的梯度拆成两条路径：
+
+| 路径 | 含义 | 公式（每个有效 token 权重 `1/N_valid`） |
+| --- | --- | --- |
+| 输入嵌入 | 查表 `h = W[input]` 的贡献 | `dW_in[r] = Σ_{输入号=r} dL/dh_t`（重复输入号累加） |
+| 输出投影 | `logits = h · Wᵀ` 的贡献 | `dW_out[r] = Σ_t (p_t[r] − onehot_t[r]) · h_t / N_valid` |
+
+对**两条路径梯度都非零**的行：
+
+* 抵消量 = 输入范数 + 输出范数 − 合并范数（合并范数是两者逐元素求和后的行范数）；
+* 抵消比例 = 抵消量 ÷（输入范数 + 输出范数）。
+
+网页按抵消量从大到小展示**前 10 行**及各自的输入范数、输出范数、合并范数和抵消比例。
+
+**可信性门槛**：`dW_in + dW_out` 必须与原共享 W 梯度**逐行一致**，最大绝对误差 ≤ `1e-8`。
+分解使用与训练相同的微批和相同的初始 W，并沿用原有词表分块约束——每个投影临时张量词表轴
+≤128，前向不为分解缓存任何分数/概率，全部按块重算。若不一致、出现非有限值或计算异常，
+响应标记 `available: false` 并给出 `reason`，**不返回任何排名/冲突结论**；网页同时清除旧诊断。
+诊断失败**不会**影响原训练对照（loss / grad / updated weight / 拆分不变量）的结论。
 
 ## 实现要点
 
@@ -145,6 +180,8 @@ python3 -m pytest tests -q
 覆盖：种子可复现、权重共享（与手工 tying 图对比）、`-100` 忽略、全忽略拒绝、
 边界与超限校验、128 token 上限、微批拆分不变量、重复 token 梯度累加、
 有限差分梯度校验、大分数数值精度、`save_for_backward` 不含分数/概率、词表分块 ≤128、
+共享梯度分解（对照两份独立 W 的 autograd 参考、忽略目标零贡献、重复输入累加、
+抵消公式、前 10 名排序、分解不一致/异常时清除诊断、分解期间分块 ≤128）、
 HTTP 路由与样例端到端通过。
 
 ## 已知限制

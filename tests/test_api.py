@@ -61,3 +61,28 @@ def test_flat_tokens_shorthand():
     })
     assert resp.status_code == 200
     assert resp.json()["ok"]
+
+
+def test_conflict_diagnostics_returned_by_api():
+    resp = client.post("/api/run", json={
+        "seed": 20240517, "scale": 1, "vocab_size": 256,
+        "microbatches": [
+            {"name": "a", "tokens": [[4, 4], [4, 4], [7, 4], [4, 7]]},
+            {"name": "b", "tokens": [[4, 4], [9, 9], [9, -100], [4, 9]]},
+        ],
+    })
+    assert resp.status_code == 200
+    report = resp.json()
+    conflict = report["conflict"]
+    assert conflict["available"] is True
+    assert conflict["decomposition_max_abs_diff"] <= 1e-8
+    assert conflict["max_vocab_chunk"] == 128
+    assert 1 <= len(conflict["top_rows"]) <= 10
+    assert conflict["top_rows"][0]["row"] == 4
+    assert report["ok"]  # training comparison still passes
+
+
+def test_index_page_has_conflict_section():
+    html = client.get("/").text
+    assert "共享行冲突诊断" in html
+    assert "冲突诊断不可用" in html

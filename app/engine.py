@@ -396,6 +396,197 @@ def run_chunked(spec: RunSpec) -> ChunkedResult:
 
 
 # ---------------------------------------------------------------------------
+# Gradient decomposition: input-embedding path vs output-projection path
+# ---------------------------------------------------------------------------
+@dataclass
+class GradientDecomposition:
+    """Row-wise decomposition of dL/dW for a tied (shared) embedding matrix.
+
+    ``input_grad`` is the contribution flowing through the lookup
+    ``hidden = W[input_ids]``; ``output_grad`` is the contribution of the
+    projection ``logits = hidden @ W.T``.  Their sum is the gradient of the
+    shared parameter.
+    """
+
+    input_grad: torch.Tensor
+    output_grad: torch.Tensor
+
+
+def _valid_token_count(spec: RunSpec) -> int:
+    return sum(
+        1 for mb in spec.microbatches for t in mb.target_ids if t != IGNORE_INDEX
+    )
+
+
+def decompose_shared_gradient(
+    spec: RunSpec, weight: torch.Tensor
+) -> GradientDecomposition:
+    """Split ``dL/dW`` into its two tying roles, with the vocab chunk cap.
+
+    The loss is the global mean cross entropy over all valid targets, so each
+    valid token carries the weight ``1 / N_valid``.  Everything is recomputed
+    chunk by chunk: every projection temporary has a vocab axis of at most
+    ``MAX_VOCAB_CHUNK``, and no ``[tokens, vocab]`` tensor is ever materialised.
+
+    * output path: ``dW_out[r] = sum_t (p_t[r] - onehot_t[r]) * h_t / N``
+    * input path:  ``dW_in[r]  = sum_{t: input_id_t == r} dL/dh_t``
+      (repeated input ids accumulate; ``-100`` tokens never enter the loss,
+      so they contribute to neither path).
+    """
+    if weight.dim() != 2 or weight.shape[1] != EMBED_DIM:
+        raise ValidationError("共享权重形状必须为 [vocab_size, 16]")
+    n_valid_total = _valid_token_count(spec)
+    if n_valid_total <= 0:
+        raise ValidationError("所有目标都被 -100 忽略：无法分解梯度")
+
+    input_grad = torch.zeros_like(weight)
+    output_grad = torch.zeros_like(weight)
+
+    for mb in spec.microbatches:
+        valid_count = sum(1 for t in mb.target_ids if t != IGNORE_INDEX)
+        if valid_count == 0:
+            continue
+
+        idx = torch.tensor(mb.input_ids, dtype=torch.long)
+        tgt = torch.tensor(mb.target_ids, dtype=torch.long)
+        valid_idx = torch.nonzero(tgt != IGNORE_INDEX, as_tuple=False).flatten()
+        valid_input_ids = idx.index_select(0, valid_idx)
+        tgt = tgt.index_select(0, valid_idx)
+
+        # Mirror the custom autograd loss: hidden is looked up from the shared
+        # W (input role), then projected by the same W (output role).
+        hidden = weight.index_select(0, idx)
+        h = hidden.index_select(0, valid_idx)
+
+        # Recompute the global normaliser chunk by chunk (no cached scores).
+        lse = _token_logsumexp(h, weight)
+
+        # Exactly the same scaling the joint backward uses:
+        # grad_output / n_valid with grad_output = n_valid / n_valid_total.
+        token_scale = (valid_count / n_valid_total) / valid_count
+
+        grad_h = torch.zeros_like(h)
+        for start, end in _chunk_ranges(weight.shape[0]):
+            logits = h @ weight[start:end].t()  # [N, <=128]
+            probs = torch.exp(logits - lse.unsqueeze(1))
+            sel = (tgt >= start) & (tgt < end)
+            if bool(sel.any()):
+                rows = torch.nonzero(sel, as_tuple=False).flatten()
+                cols = tgt.index_select(0, rows) - start
+                probs[rows, cols] -= 1.0
+            probs.mul_(token_scale)
+            output_grad[start:end] += probs.t() @ h
+            grad_h += probs @ weight[start:end]
+            del logits, probs
+
+        # Scatter dL/dh back to the embedding rows.  index_add_ accumulates
+        # rows that were looked up more than once.
+        input_grad.index_add_(0, valid_input_ids, grad_h)
+
+    return GradientDecomposition(input_grad=input_grad, output_grad=output_grad)
+
+
+def build_conflict_report(
+    spec: RunSpec, weight: torch.Tensor, shared_grad: torch.Tensor
+) -> dict:
+    """Rank tied rows by how strongly the two path gradients cancel.
+
+    The decomposition is only trusted when ``input_grad + output_grad`` agrees
+    with the gradient the training step actually used, row by row, within
+    ``TOLERANCE``.  On any failure (exception, non-finite value, mismatch) the
+    result is marked unavailable and carries no rankings, so the caller can
+    clear stale diagnostics and withhold any conflict conclusion.
+    """
+    base = {
+        "available": False,
+        "tolerance": TOLERANCE,
+        "max_vocab_chunk": MAX_VOCAB_CHUNK,
+        "qualifying_rows": 0,
+        "top_rows": [],
+        "rows_with_input_grad": 0,
+        "rows_with_output_grad": 0,
+    }
+    try:
+        decomposition = decompose_shared_gradient(spec, weight)
+        reconstructed = decomposition.input_grad + decomposition.output_grad
+        max_abs_diff = _max_abs_diff(reconstructed, shared_grad)
+        if not math.isfinite(max_abs_diff):
+            return {
+                **base,
+                "reason": "梯度分解一致性检查得到非有限值",
+                "decomposition_max_abs_diff": max_abs_diff,
+            }
+        if max_abs_diff > TOLERANCE:
+            return {
+                **base,
+                "reason": "分解梯度合计与原共享 W 梯度不一致，已清除冲突诊断",
+                "decomposition_max_abs_diff": max_abs_diff,
+            }
+
+        input_norms = decomposition.input_grad.norm(dim=1)
+        output_norms = decomposition.output_grad.norm(dim=1)
+        combined_norms = reconstructed.norm(dim=1)
+
+        # NaN norms compare false everywhere, so non-finite rows are excluded
+        # here and re-checked explicitly below before ranking.
+        input_mask = (input_norms > 0) & torch.isfinite(input_norms)
+        output_mask = (output_norms > 0) & torch.isfinite(output_norms)
+        both_mask = input_mask & output_mask
+
+        rows_with_input = int(input_mask.sum().item())
+        rows_with_output = int(output_mask.sum().item())
+        both_rows = torch.nonzero(both_mask, as_tuple=False).flatten()
+
+        ranked: List[dict] = []
+        for row in both_rows.tolist():
+            in_norm = float(input_norms[row].item())
+            out_norm = float(output_norms[row].item())
+            combined = float(combined_norms[row].item())
+            norm_sum = in_norm + out_norm
+            cancellation = norm_sum - combined
+            if not (
+                math.isfinite(in_norm)
+                and math.isfinite(out_norm)
+                and math.isfinite(combined)
+                and math.isfinite(cancellation)
+                and norm_sum > 0
+            ):
+                return {
+                    **base,
+                    "reason": "冲突指标出现非有限值，已清除冲突诊断",
+                    "decomposition_max_abs_diff": max_abs_diff,
+                    "rows_with_input_grad": rows_with_input,
+                    "rows_with_output_grad": rows_with_output,
+                }
+            ranked.append(
+                {
+                    "row": int(row),
+                    "input_norm": in_norm,
+                    "output_norm": out_norm,
+                    "combined_norm": combined,
+                    "norm_sum": norm_sum,
+                    "cancellation": cancellation,
+                    "cancellation_ratio": cancellation / norm_sum,
+                }
+            )
+
+        # Largest cancellation first; row id breaks ties deterministically.
+        ranked.sort(key=lambda item: (-item["cancellation"], item["row"]))
+        return {
+            "available": True,
+            "tolerance": TOLERANCE,
+            "max_vocab_chunk": MAX_VOCAB_CHUNK,
+            "decomposition_max_abs_diff": max_abs_diff,
+            "rows_with_input_grad": rows_with_input,
+            "rows_with_output_grad": rows_with_output,
+            "qualifying_rows": len(ranked),
+            "top_rows": ranked[:10],
+        }
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break training
+        return {**base, "reason": f"梯度分解计算失败：{exc}"}
+
+
+# ---------------------------------------------------------------------------
 # Helpers for split experiments
 # ---------------------------------------------------------------------------
 def _flatten(spec: RunSpec) -> Tuple[List[int], List[int]]:
@@ -508,6 +699,12 @@ def evaluate(payload: dict) -> dict:
     }
     passed = all(checks.values())
 
+    # Tied-embedding conflict diagnostics: reuse the same micro-batches and the
+    # same initial W as the training run above.  This never influences the
+    # training verification result; if it cannot be trusted it reports
+    # ``available: false`` with no ranking.
+    conflict = build_conflict_report(spec, user.base_weight, user.grad)
+
     return {
         "ok": passed,
         "tolerance": TOLERANCE,
@@ -553,6 +750,7 @@ def evaluate(payload: dict) -> dict:
             "runs": split_runs,
         },
         "checks": checks,
+        "conflict": conflict,
         "memory": {
             "max_vocab_chunk": MAX_VOCAB_CHUNK,
             "saved_shapes_per_microbatch": user.saved_shapes,
